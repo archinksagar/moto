@@ -1,4 +1,5 @@
-from typing import Any, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional, Union
+
 from moto.core.exceptions import RESTError
 
 if TYPE_CHECKING:
@@ -62,6 +63,13 @@ class AccessForbidden(S3ClientError):
 
     def __init__(self, msg: str):
         super().__init__("AccessForbidden", msg)
+
+
+class BadRequest(S3ClientError):
+    code = 403
+
+    def __init__(self, msg: str):
+        super().__init__("BadRequest", msg)
 
 
 class BucketError(S3ClientError):

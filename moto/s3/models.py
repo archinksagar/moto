@@ -1,21 +1,27 @@
+import base64
+import codecs
+import copy
+import datetime
+import itertools
 import json
 import os
-import base64
-import datetime
-import copy
-import itertools
-import codecs
 import string
+import sys
 import tempfile
 import threading
-import sys
 import urllib.parse
-
 from bisect import insort
-from typing import Any, Dict, List, Optional, Set, Tuple, Iterator, Union
 from importlib import reload
-from moto.core import BaseBackend, BaseModel, BackendDict, CloudFormationModel
-from moto.core import CloudWatchMetricProvider
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+
+from moto.cloudwatch.models import MetricDatum
+from moto.core import (
+    BackendDict,
+    BaseBackend,
+    BaseModel,
+    CloudFormationModel,
+    CloudWatchMetricProvider,
+)
 from moto.core.utils import (
     iso_8601_datetime_without_milliseconds_s3,
     rfc_1123_datetime,
@@ -23,43 +29,53 @@ from moto.core.utils import (
     unix_time_millis,
     utcnow,
 )
-from moto.cloudwatch.models import MetricDatum
 from moto.moto_api import state_manager
 from moto.moto_api._internal import mock_random as random
 from moto.moto_api._internal.managed_state_model import ManagedState
-from moto.utilities.tagging_service import TaggingService
-from moto.utilities.utils import LowercaseDict, md5_hash
 from moto.s3.exceptions import (
     AccessDeniedByLock,
+    BadRequest,
     BucketAlreadyExists,
     BucketNeedsToBeNew,
     CopyObjectMustChangeSomething,
-    MissingBucket,
-    InvalidBucketName,
-    InvalidPart,
-    InvalidRequest,
-    EntityTooSmall,
-    MissingKey,
-    InvalidNotificationDestination,
-    MalformedXML,
-    HeadOnDeleteMarker,
-    InvalidStorageClass,
-    InvalidTargetBucketForLogging,
     CrossLocationLoggingProhibitted,
-    NoSuchPublicAccessBlockConfiguration,
+    EntityTooSmall,
+    HeadOnDeleteMarker,
+    InvalidBucketName,
+    InvalidNotificationDestination,
+    InvalidPart,
     InvalidPublicAccessBlockConfiguration,
+    InvalidRequest,
+    InvalidStorageClass,
+    InvalidTagError,
+    InvalidTargetBucketForLogging,
+    MalformedXML,
+    MissingBucket,
+    MissingKey,
+    NoSuchPublicAccessBlockConfiguration,
     NoSuchUpload,
     ObjectLockConfigurationNotFoundError,
-    InvalidTagError,
 )
-from .cloud_formation import cfn_to_api_encryption, is_replacement_update
-from . import notifications
-from .select_object_content import parse_query
-from .utils import _VersionedKeyStore, CaseInsensitiveDict
-from .utils import ARCHIVE_STORAGE_CLASSES, STORAGE_CLASS, LOGGING_SERVICE_PRINCIPAL
+from moto.utilities.tagging_service import TaggingService
+from moto.utilities.utils import LowercaseDict, md5_hash
+
 from ..events.notifications import send_notification as events_send_notification
-from ..settings import get_s3_default_key_buffer_size, S3_UPLOAD_PART_MIN_SIZE
-from ..settings import s3_allow_crossdomain_access
+from ..settings import (
+    S3_UPLOAD_PART_MIN_SIZE,
+    get_s3_default_key_buffer_size,
+    s3_allow_crossdomain_access,
+)
+from . import notifications
+from .cloud_formation import cfn_to_api_encryption, is_replacement_update
+from .select_object_content import parse_query
+from .utils import (
+    ARCHIVE_STORAGE_CLASSES,
+    LOGGING_SERVICE_PRINCIPAL,
+    STORAGE_CLASS,
+    CaseInsensitiveDict,
+    _VersionedKeyStore,
+    compute_checksum,
+)
 
 MAX_BUCKET_NAME_LENGTH = 63
 MIN_BUCKET_NAME_LENGTH = 3
@@ -385,10 +401,14 @@ class FakeMultipart(BaseModel):
         self.sse_encryption = sse_encryption
         self.kms_key_id = kms_key_id
 
-    def complete(self, body: Iterator[Tuple[int, str]]) -> Tuple[bytes, str]:
+    def complete(
+        self, body: Iterator[Tuple[int, str]]
+    ) -> Tuple[bytes, str, Optional[str]]:
+        checksum_algo = self.metadata.get("x-amz-checksum-algorithm")
         decode_hex = codecs.getdecoder("hex_codec")
         total = bytearray()
         md5s = bytearray()
+        checksum = bytearray()
 
         last = None
         count = 0
@@ -404,6 +424,10 @@ class FakeMultipart(BaseModel):
                 raise EntityTooSmall()
             md5s.extend(decode_hex(part_etag)[0])  # type: ignore
             total.extend(part.value)
+            if checksum_algo:
+                checksum.extend(
+                    compute_checksum(part.value, checksum_algo, encode_base64=False)
+                )
             last = part
             count += 1
 
@@ -412,7 +436,11 @@ class FakeMultipart(BaseModel):
 
         full_etag = md5_hash()
         full_etag.update(bytes(md5s))
-        return total, f"{full_etag.hexdigest()}-{count}"
+        if checksum_algo:
+            encoded_checksum = compute_checksum(checksum, checksum_algo).decode("utf-8")
+        else:
+            encoded_checksum = None
+        return total, f"{full_etag.hexdigest()}-{count}", encoded_checksum
 
     def set_part(self, part_id: int, value: bytes) -> FakeKey:
         if part_id < 1:
@@ -2134,7 +2162,7 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
     def get_object_tagging(self, key: FakeKey) -> Dict[str, List[Dict[str, str]]]:
         return self.tagger.list_tags_for_resource(key.arn)
 
-    def set_key_tags(
+    def put_object_tagging(
         self,
         key: Optional[FakeKey],
         tags: Optional[Dict[str, str]],
@@ -2142,12 +2170,19 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
     ) -> FakeKey:
         if key is None:
             raise MissingKey(key=key_name)
-        boto_tags_dict = self.tagger.convert_dict_to_tags_input(tags)
-        errmsg = self.tagger.validate_tags(boto_tags_dict)
+        tags_input = self.tagger.convert_dict_to_tags_input(tags)
+        # Validation custom to S3
+        if tags:
+            if len(tags_input) > 10:
+                raise BadRequest("Object tags cannot be greater than 10")
+            if any([tagkey.startswith("aws") for tagkey in tags.keys()]):
+                raise InvalidTagError("Your TagKey cannot be prefixed with aws:")
+        # Validation shared across all services
+        errmsg = self.tagger.validate_tags(tags_input)
         if errmsg:
             raise InvalidTagError(errmsg)
         self.tagger.delete_all_tags_for_resource(key.arn)
-        self.tagger.tag_resource(key.arn, boto_tags_dict)
+        self.tagger.tag_resource(key.arn, tags_input)
         return key
 
     def get_bucket_tagging(self, bucket_name: str) -> Dict[str, List[Dict[str, str]]]:
@@ -2305,13 +2340,13 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
 
     def complete_multipart_upload(
         self, bucket_name: str, multipart_id: str, body: Iterator[Tuple[int, str]]
-    ) -> Tuple[FakeMultipart, bytes, str]:
+    ) -> Tuple[FakeMultipart, bytes, str, Optional[str]]:
         bucket = self.get_bucket(bucket_name)
         multipart = bucket.multiparts[multipart_id]
-        value, etag = multipart.complete(body)
+        value, etag, checksum = multipart.complete(body)
         if value is not None:
             del bucket.multiparts[multipart_id]
-        return multipart, value, etag
+        return multipart, value, etag, checksum
 
     def get_all_multiparts(self, bucket_name: str) -> Dict[str, FakeMultipart]:
         bucket = self.get_bucket(bucket_name)
@@ -2324,7 +2359,7 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
         multipart = bucket.multiparts[multipart_id]
         return multipart.set_part(part_id, value)
 
-    def copy_part(
+    def upload_part_copy(
         self,
         dest_bucket_name: str,
         multipart_id: str,
@@ -2619,7 +2654,7 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider):
         ]
 
 
-class S3BackendDict(BackendDict):
+class S3BackendDict(BackendDict[S3Backend]):
     """
     Encapsulation class to hold S3 backends.
 

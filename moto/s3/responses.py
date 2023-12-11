@@ -1,71 +1,77 @@
 import io
 import re
-from typing import Any, Dict, List, Iterator, Union, Tuple, Optional, Type
-
 import urllib.parse
-
-from moto import settings
-from moto.core.utils import (
-    extract_region_from_aws_authorization,
-    str_to_rfc_1123_datetime,
-)
-from urllib.parse import parse_qs, urlparse, unquote, urlencode, urlunparse
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Type, Union
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
+from xml.dom import minidom
 
 import xmltodict
 
+from moto import settings
 from moto.core.common_types import TYPE_RESPONSE
 from moto.core.responses import BaseResponse
-from moto.core.utils import path_url
-
+from moto.core.utils import (
+    extract_region_from_aws_authorization,
+    path_url,
+    str_to_rfc_1123_datetime,
+)
 from moto.s3bucket_path.utils import (
     bucket_name_from_url as bucketpath_bucket_name_from_url,
+)
+from moto.s3bucket_path.utils import (
     parse_key_name as bucketpath_parse_key_name,
 )
 from moto.utilities.aws_headers import amzn_request_id
 
 from .exceptions import (
-    BucketAlreadyExists,
+    AccessForbidden,
     BucketAccessDeniedError,
+    BucketAlreadyExists,
     BucketMustHaveLockeEnabled,
     DuplicateTagKeys,
+    HeadOnDeleteMarker,
+    IllegalLocationConstraintException,
     InvalidContentMD5,
     InvalidContinuationToken,
-    S3ClientError,
-    HeadOnDeleteMarker,
+    InvalidMaxPartArgument,
+    InvalidMaxPartNumberArgument,
+    InvalidNotificationARN,
+    InvalidNotificationEvent,
+    InvalidObjectState,
+    InvalidPartOrder,
+    InvalidRange,
+    LockNotEnabled,
+    MalformedACLError,
+    MalformedXML,
     MissingBucket,
     MissingKey,
     MissingVersion,
-    InvalidMaxPartArgument,
-    InvalidMaxPartNumberArgument,
-    NotAnIntegerException,
-    InvalidPartOrder,
-    MalformedXML,
-    MalformedACLError,
-    IllegalLocationConstraintException,
-    InvalidNotificationARN,
-    InvalidNotificationEvent,
-    S3AclAndGrantError,
-    InvalidObjectState,
-    ObjectNotInActiveTierError,
     NoSystemTags,
+    NotAnIntegerException,
+    ObjectNotInActiveTierError,
     PreconditionFailed,
-    InvalidRange,
-    LockNotEnabled,
-    AccessForbidden,
+    S3AclAndGrantError,
+    S3ClientError,
 )
-from .models import s3_backends, S3Backend
-from .models import get_canned_acl, FakeGrantee, FakeGrant, FakeAcl, FakeKey, FakeBucket
+from .models import (
+    FakeAcl,
+    FakeBucket,
+    FakeGrant,
+    FakeGrantee,
+    FakeKey,
+    S3Backend,
+    get_canned_acl,
+    s3_backends,
+)
 from .select_object_content import serialize_select
 from .utils import (
+    ARCHIVE_STORAGE_CLASSES,
     bucket_name_from_url,
+    compute_checksum,
+    cors_matches_origin,
     metadata_from_headers,
     parse_region_from_url,
-    compute_checksum,
-    ARCHIVE_STORAGE_CLASSES,
-    cors_matches_origin,
 )
-from xml.dom import minidom
-
 
 DEFAULT_REGION_NAME = "us-east-1"
 
@@ -882,7 +888,7 @@ class S3Response(BaseResponse):
         elif "tagging" in querystring:
             tagging = self._bucket_tagging_from_body()
             self.backend.put_bucket_tagging(bucket_name, tagging)
-            return ""
+            return 204, {}, ""
         elif "website" in querystring:
             self.backend.set_bucket_website_configuration(bucket_name, self.body)
             return ""
@@ -1501,7 +1507,7 @@ class S3Response(BaseResponse):
                 if self.backend.get_object(
                     src_bucket, src_key, version_id=src_version_id
                 ):
-                    key = self.backend.copy_part(
+                    key = self.backend.upload_part_copy(
                         bucket_name,
                         upload_id,
                         part_number,
@@ -1623,7 +1629,7 @@ class S3Response(BaseResponse):
                 bucket_name, key_name, version_id=version_id
             )
             tagging = self._tagging_from_xml(body)
-            self.backend.set_key_tags(key_to_tag, tagging, key_name)
+            self.backend.put_object_tagging(key_to_tag, tagging, key_name)
             return 200, response_headers, ""
 
         if "x-amz-copy-source" in request.headers:
@@ -1686,7 +1692,7 @@ class S3Response(BaseResponse):
             tdirective = request.headers.get("x-amz-tagging-directive")
             if tdirective == "REPLACE":
                 tagging = self._tagging_from_headers(request.headers)
-                self.backend.set_key_tags(new_key, tagging)
+                self.backend.put_object_tagging(new_key, tagging)
             if key_to_copy.version_id != "null":
                 response_headers[
                     "x-amz-copy-source-version-id"
@@ -1701,6 +1707,8 @@ class S3Response(BaseResponse):
                 response_headers.update(
                     {"Checksum": {f"Checksum{checksum_algorithm}": checksum_value}}
                 )
+                # By default, the checksum-details for the copy will be the same as the original
+                # But if another algorithm is provided during the copy-operation, we override the values
                 new_key.checksum_algorithm = checksum_algorithm
                 new_key.checksum_value = checksum_value
 
@@ -1734,7 +1742,7 @@ class S3Response(BaseResponse):
         )
         if checksum_algorithm:
             new_key.checksum_algorithm = checksum_algorithm
-        self.backend.set_key_tags(new_key, tagging)
+        self.backend.put_object_tagging(new_key, tagging)
 
         response_headers.update(new_key.response_dict)
         # Remove content-length - the response body is empty for this request
@@ -2246,12 +2254,13 @@ class S3Response(BaseResponse):
         if query.get("uploadId"):
             multipart_id = query["uploadId"][0]
 
-            multipart, value, etag = self.backend.complete_multipart_upload(
+            multipart, value, etag, checksum = self.backend.complete_multipart_upload(
                 bucket_name, multipart_id, self._complete_multipart_body(body)
             )
             if value is None:
                 return 400, {}, ""
 
+            headers: Dict[str, Any] = {}
             key = self.backend.put_object(
                 bucket_name,
                 multipart.key_name,
@@ -2263,7 +2272,14 @@ class S3Response(BaseResponse):
                 kms_key_id=multipart.kms_key_id,
             )
             key.set_metadata(multipart.metadata)
-            self.backend.set_key_tags(key, multipart.tags)
+
+            if checksum:
+                key.checksum_algorithm = multipart.metadata.get(
+                    "x-amz-checksum-algorithm"
+                )
+                key.checksum_value = checksum
+
+            self.backend.put_object_tagging(key, multipart.tags)
             self.backend.put_object_acl(
                 bucket_name=bucket_name,
                 key_name=key.name,
@@ -2271,7 +2287,6 @@ class S3Response(BaseResponse):
             )
 
             template = self.response_template(S3_MULTIPART_COMPLETE_RESPONSE)
-            headers: Dict[str, Any] = {}
             if key.version_id:
                 headers["x-amz-version-id"] = key.version_id
 
