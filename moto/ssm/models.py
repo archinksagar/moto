@@ -514,7 +514,7 @@ class Documents(BaseModel):
             "HashType": "Sha256",
             "Name": document.name,
             "Owner": document.owner,
-            "CreatedDate": document.created_date.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "CreatedDate": document..strftime("%Y-%m-%dT%H:%M:%SZ"),
             "Status": document.status,
             "DocumentVersion": document.document_version,
             "Description": document.description,
